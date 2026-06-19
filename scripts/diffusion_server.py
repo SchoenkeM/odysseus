@@ -574,6 +574,91 @@ def generate_image(req: ImageRequest):
     }
 
 
+class Img2ImgRequest(BaseModel):
+    image: str          # base64 PNG — source image
+    prompt: str
+    strength: float = 0.75  # 0=no change, 1=full regeneration
+    negative_prompt: str = ""
+    width: int = 0
+    height: int = 0
+    steps: int = 0
+    guidance_scale: float = 7.0
+    response_format: str = "b64_json"
+
+
+@app.post("/v1/images/img2img")
+def img2img(req: Img2ImgRequest):
+    """Image-to-image: transform an existing image guided by a prompt.
+    strength=0.3 → subtle style shift, strength=0.75 → heavy rework."""
+    if _pipe is None:
+        return {"error": "Model not loaded"}
+
+    from PIL import Image as PILImage
+
+    img_bytes = base64.b64decode(req.image)
+    init_image = PILImage.open(io.BytesIO(img_bytes)).convert("RGB")
+    orig_w, orig_h = init_image.size
+
+    # Work at a model-friendly resolution (multiples of 8, ≤1024 on long side)
+    max_side = 1024
+    scale = min(max_side / max(orig_w, orig_h), 1.0)
+    work_w = max(64, ((int(orig_w * scale) + 7) // 8) * 8)
+    work_h = max(64, ((int(orig_h * scale) + 7) // 8) * 8)
+    if req.width and req.height:
+        work_w = (req.width  // 8) * 8
+        work_h = (req.height // 8) * 8
+    init_resized = init_image.resize((work_w, work_h), PILImage.LANCZOS)
+
+    steps = req.steps or (_args.steps or 20)
+    strength = max(0.1, min(1.0, req.strength))
+
+    logger.info(f"img2img: {req.prompt[:80]}… ({work_w}x{work_h}, strength={strength}, {steps} steps)")
+    start = time.time()
+
+    alt_pipe, alt_type = _get_inpaint_pipe()
+    i2i_pipe = _img2img_pipe if _img2img_pipe else (alt_pipe if alt_type == 'img2img' else None)
+
+    try:
+        if i2i_pipe:
+            kwargs = dict(
+                prompt=req.prompt,
+                image=init_resized,
+                strength=strength,
+                num_inference_steps=steps,
+                guidance_scale=req.guidance_scale,
+            )
+            if req.negative_prompt:
+                kwargs["negative_prompt"] = req.negative_prompt
+            result = i2i_pipe(**kwargs)
+        else:
+            # Fallback: use main pipeline if it accepts an image arg
+            result = _pipe(
+                prompt=req.prompt,
+                image=init_resized,
+                strength=strength,
+                num_inference_steps=steps,
+                guidance_scale=req.guidance_scale,
+            )
+    except TypeError:
+        return {"error": "This model does not support img2img. Try strength<1.0 with an inpaint pipeline, or use a dedicated img2img model."}
+
+    img = result.images[0]
+    if img.size != (orig_w, orig_h):
+        img = img.resize((orig_w, orig_h), PILImage.LANCZOS)
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    b64 = base64.b64encode(buf.getvalue()).decode()
+    elapsed = time.time() - start
+    logger.info(f"img2img done in {elapsed:.1f}s")
+
+    return {
+        "created": int(time.time()),
+        "data": [{"b64_json": b64}],
+        "elapsed": round(elapsed, 2),
+    }
+
+
 class InpaintRequest(BaseModel):
     image: str  # base64 PNG
     mask: str   # base64 PNG (white = inpaint area)

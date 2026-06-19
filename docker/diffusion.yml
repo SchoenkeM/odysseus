@@ -58,6 +58,8 @@ services:
   # ── FLUX.1-schnell (Apache 2.0) ── läuft immer, kein Profile nötig
   diffusion:
     <<: *diffusion-base
+    ports:
+      - "127.0.0.1:8110:8100"
     command:
       - "--model"
       - "black-forest-labs/FLUX.1-schnell"
@@ -77,6 +79,8 @@ services:
   diffusion-dev:
     <<: *diffusion-base
     profiles: [flux-dev]
+    ports:
+      - "127.0.0.1:8101:8101"
     command:
       - "--model"
       - "black-forest-labs/FLUX.1-dev"
@@ -96,6 +100,8 @@ services:
   diffusion-juggernaut:
     <<: *diffusion-base
     profiles: [juggernaut]
+    ports:
+      - "127.0.0.1:8102:8102"
     command:
       - "--model"
       - "RunDiffusion/Juggernaut-XL-v9"
@@ -114,6 +120,8 @@ services:
   diffusion-realvis:
     <<: *diffusion-base
     profiles: [realvis]
+    ports:
+      - "127.0.0.1:8103:8103"
     command:
       - "--model"
       - "SG161222/RealVisXL_V4.0"
@@ -132,6 +140,8 @@ services:
   diffusion-dreamshaper:
     <<: *diffusion-base
     profiles: [dreamshaper]
+    ports:
+      - "127.0.0.1:8104:8104"
     command:
       - "--model"
       - "Lykon/dreamshaper-xl-v2-turbo"
