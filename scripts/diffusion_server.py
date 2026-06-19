@@ -25,7 +25,9 @@ import base64
 import io
 import json
 import logging
+import threading
 import time
+import traceback
 from pathlib import Path
 
 from contextlib import asynccontextmanager
@@ -44,6 +46,7 @@ _pipe = None
 _model_id = ""
 DTYPE_MAP = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
 _args = None
+_pipe_lock = threading.Lock()  # FLUX scheduler is stateful — concurrent calls corrupt sigmas
 
 
 @asynccontextmanager
@@ -534,36 +537,43 @@ def generate_image(req: ImageRequest):
     _is_inpaint_pipe = 'inpaint' in type(_pipe).__name__.lower()
 
     images = []
-    for _ in range(req.n):
-        if _is_inpaint_pipe:
-            # Inpaint pipelines need an image + mask — create blank ones for txt2img
-            from PIL import Image as _PILGen
-            _blank = _PILGen.new('RGB', (width, height), (128, 128, 128))
-            _mask = _PILGen.new('L', (width, height), 255)  # full white = regenerate everything
-            result = _pipe(
-                prompt=req.prompt,
-                image=_blank,
-                mask_image=_mask,
-                width=width,
-                height=height,
-                num_inference_steps=steps,
-                guidance_scale=3.5,
-            )
-        else:
-            result = _pipe(
-                prompt=req.prompt,
-                width=width,
-                height=height,
-                num_inference_steps=steps,
-                guidance_scale=3.5,
-            )
-        img = result.images[0]
+    try:
+        with _pipe_lock:
+            for _ in range(req.n):
+                if _is_inpaint_pipe:
+                    # Inpaint pipelines need an image + mask — create blank ones for txt2img
+                    from PIL import Image as _PILGen
+                    _blank = _PILGen.new('RGB', (width, height), (128, 128, 128))
+                    _mask = _PILGen.new('L', (width, height), 255)  # full white = regenerate everything
+                    result = _pipe(
+                        prompt=req.prompt,
+                        image=_blank,
+                        mask_image=_mask,
+                        width=width,
+                        height=height,
+                        num_inference_steps=steps,
+                        guidance_scale=3.5,
+                    )
+                else:
+                    result = _pipe(
+                        prompt=req.prompt,
+                        width=width,
+                        height=height,
+                        num_inference_steps=steps,
+                        guidance_scale=3.5,
+                    )
+                img = result.images[0]
 
-        # Convert to base64
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        b64 = base64.b64encode(buf.getvalue()).decode()
-        images.append({"b64_json": b64})
+                # Convert to base64
+                buf = io.BytesIO()
+                img.save(buf, format="PNG")
+                b64 = base64.b64encode(buf.getvalue()).decode()
+                images.append({"b64_json": b64})
+    except Exception as exc:
+        tb = traceback.format_exc()
+        logger.error(f"Image generation failed: {exc}\n{tb}")
+        from fastapi import HTTPException
+        raise HTTPException(status_code=500, detail=str(exc))
 
     elapsed = time.time() - start
     logger.info(f"Generated {req.n} image(s) in {elapsed:.1f}s")
@@ -619,26 +629,27 @@ def img2img(req: Img2ImgRequest):
     i2i_pipe = _img2img_pipe if _img2img_pipe else (alt_pipe if alt_type == 'img2img' else None)
 
     try:
-        if i2i_pipe:
-            kwargs = dict(
-                prompt=req.prompt,
-                image=init_resized,
-                strength=strength,
-                num_inference_steps=steps,
-                guidance_scale=req.guidance_scale,
-            )
-            if req.negative_prompt:
-                kwargs["negative_prompt"] = req.negative_prompt
-            result = i2i_pipe(**kwargs)
-        else:
-            # Fallback: use main pipeline if it accepts an image arg
-            result = _pipe(
-                prompt=req.prompt,
-                image=init_resized,
-                strength=strength,
-                num_inference_steps=steps,
-                guidance_scale=req.guidance_scale,
-            )
+        with _pipe_lock:
+            if i2i_pipe:
+                kwargs = dict(
+                    prompt=req.prompt,
+                    image=init_resized,
+                    strength=strength,
+                    num_inference_steps=steps,
+                    guidance_scale=req.guidance_scale,
+                )
+                if req.negative_prompt:
+                    kwargs["negative_prompt"] = req.negative_prompt
+                result = i2i_pipe(**kwargs)
+            else:
+                # Fallback: use main pipeline if it accepts an image arg
+                result = _pipe(
+                    prompt=req.prompt,
+                    image=init_resized,
+                    strength=strength,
+                    num_inference_steps=steps,
+                    guidance_scale=req.guidance_scale,
+                )
     except TypeError:
         return {"error": "This model does not support img2img. Try strength<1.0 with an inpaint pipeline, or use a dedicated img2img model."}
 
@@ -813,152 +824,153 @@ def inpaint_image(req: InpaintRequest):
         except Exception as e:
             logger.warning(f"Could not upcast VAE: {e}")
 
-    try:
-        if alt_type == 'inpaint' and alt_pipe:
-            # Use dedicated inpaint pipeline. guidance_scale 7.5 is the
-            # SDXL default — the previous 3.5 was producing muted / grey
-            # results, especially on style-transfer prompts with large
-            # masks.
-            logger.info("Using dedicated inpaint pipeline")
-            result = alt_pipe(
-                prompt=req.prompt,
-                image=work_init,
-                mask_image=work_mask,
-                width=work_w,
-                height=work_h,
-                num_inference_steps=steps,
-                strength=strength,
-                guidance_scale=7.5,
-            )
-        elif alt_type == 'img2img' and alt_pipe:
-            raise TypeError("Skip to img2img fallback")
-        else:
-            # Try the main pipeline with inpaint args
-            result = _pipe(
-                prompt=req.prompt,
-                image=work_init,
-                mask_image=work_mask,
-                width=work_w,
-                height=work_h,
-                num_inference_steps=steps,
-                strength=strength,
-                guidance_scale=7.5,
-            )
-    except TypeError:
-        # Pipeline doesn't support native inpainting — use crop-to-mask + img2img + composite
-        # This preserves context by only regenerating the masked region with surrounding padding
-        import numpy as np
-        logger.info(f"Pipeline doesn't support inpainting — using crop+img2img (strength={strength}) + composite")
-
-        mask_resized = mask_image.resize((width, height))
-        init_resized = init_image.resize((width, height))
-        mask_arr = np.array(mask_resized)
-
-        # Find bounding box of the mask
-        ys, xs = np.where(mask_arr > 10)
-        if len(xs) == 0 or len(ys) == 0:
-            logger.warning("Empty mask — returning original image")
-            buf = io.BytesIO()
-            init_resized.save(buf, format="PNG")
-            return {"image": base64.b64encode(buf.getvalue()).decode(), "elapsed": 0}
-
-        x1, y1, x2, y2 = int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
-
-        # Add generous padding (50% of mask size, min 64px) so model sees surrounding context
-        pad_x = max(64, int((x2 - x1) * 0.5))
-        pad_y = max(64, int((y2 - y1) * 0.5))
-        cx1 = max(0, x1 - pad_x)
-        cy1 = max(0, y1 - pad_y)
-        cx2 = min(width, x2 + pad_x)
-        cy2 = min(height, y2 + pad_y)
-
-        # Make crop square and round to multiple of 64 (SD3 VAE requirement)
-        crop_size = max(cx2 - cx1, cy2 - cy1)
-        crop_size = max(256, ((crop_size + 63) // 64) * 64)  # min 256, round up to 64
-        # Center the square crop on the mask center
-        cx_mid = (cx1 + cx2) // 2
-        cy_mid = (cy1 + cy2) // 2
-        cx1 = max(0, cx_mid - crop_size // 2)
-        cy1 = max(0, cy_mid - crop_size // 2)
-        cx2 = min(width, cx1 + crop_size)
-        cy2 = min(height, cy1 + crop_size)
-        # Adjust if we hit image edges
-        if cx2 - cx1 < crop_size:
-            cx1 = max(0, cx2 - crop_size)
-        if cy2 - cy1 < crop_size:
-            cy1 = max(0, cy2 - crop_size)
-        cw = cx2 - cx1
-        ch = cy2 - cy1
-
-        logger.info(f"Mask bbox: ({x1},{y1})-({x2},{y2}), crop region: ({cx1},{cy1})-({cx2},{cy2}) = {cw}x{ch}")
-
-        # Crop the original image and mask to the region
-        crop_img = init_resized.crop((cx1, cy1, cx2, cy2))
-        crop_mask = mask_resized.crop((cx1, cy1, cx2, cy2))
-
-        # Use img2img pipeline if available, otherwise fall back
-        _i2i_pipe = alt_pipe if alt_type == 'img2img' else None
-        # Ensure crop image is properly sized (multiple of 8)
-        crop_img = crop_img.resize((cw, ch))
+    with _pipe_lock:
         try:
-            if _i2i_pipe:
-                logger.info(f"Using img2img pipeline on crop ({cw}x{ch})")
-                result = _i2i_pipe(
+            if alt_type == 'inpaint' and alt_pipe:
+                # Use dedicated inpaint pipeline. guidance_scale 7.5 is the
+                # SDXL default — the previous 3.5 was producing muted / grey
+                # results, especially on style-transfer prompts with large
+                # masks.
+                logger.info("Using dedicated inpaint pipeline")
+                result = alt_pipe(
                     prompt=req.prompt,
-                    image=crop_img,
+                    image=work_init,
+                    mask_image=work_mask,
+                    width=work_w,
+                    height=work_h,
                     num_inference_steps=steps,
                     strength=strength,
-                    guidance_scale=7.0,
+                    guidance_scale=7.5,
                 )
+            elif alt_type == 'img2img' and alt_pipe:
+                raise TypeError("Skip to img2img fallback")
             else:
-                # Try main pipeline with image arg
+                # Try the main pipeline with inpaint args
                 result = _pipe(
                     prompt=req.prompt,
-                    image=crop_img,
+                    image=work_init,
+                    mask_image=work_mask,
+                    width=work_w,
+                    height=work_h,
                     num_inference_steps=steps,
                     strength=strength,
+                    guidance_scale=7.5,
+                )
+        except TypeError:
+            # Pipeline doesn't support native inpainting — use crop-to-mask + img2img + composite
+            # This preserves context by only regenerating the masked region with surrounding padding
+            import numpy as np
+            logger.info(f"Pipeline doesn't support inpainting — using crop+img2img (strength={strength}) + composite")
+
+            mask_resized = mask_image.resize((width, height))
+            init_resized = init_image.resize((width, height))
+            mask_arr = np.array(mask_resized)
+
+            # Find bounding box of the mask
+            ys, xs = np.where(mask_arr > 10)
+            if len(xs) == 0 or len(ys) == 0:
+                logger.warning("Empty mask — returning original image")
+                buf = io.BytesIO()
+                init_resized.save(buf, format="PNG")
+                return {"image": base64.b64encode(buf.getvalue()).decode(), "elapsed": 0}
+
+            x1, y1, x2, y2 = int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
+
+            # Add generous padding (50% of mask size, min 64px) so model sees surrounding context
+            pad_x = max(64, int((x2 - x1) * 0.5))
+            pad_y = max(64, int((y2 - y1) * 0.5))
+            cx1 = max(0, x1 - pad_x)
+            cy1 = max(0, y1 - pad_y)
+            cx2 = min(width, x2 + pad_x)
+            cy2 = min(height, y2 + pad_y)
+
+            # Make crop square and round to multiple of 64 (SD3 VAE requirement)
+            crop_size = max(cx2 - cx1, cy2 - cy1)
+            crop_size = max(256, ((crop_size + 63) // 64) * 64)  # min 256, round up to 64
+            # Center the square crop on the mask center
+            cx_mid = (cx1 + cx2) // 2
+            cy_mid = (cy1 + cy2) // 2
+            cx1 = max(0, cx_mid - crop_size // 2)
+            cy1 = max(0, cy_mid - crop_size // 2)
+            cx2 = min(width, cx1 + crop_size)
+            cy2 = min(height, cy1 + crop_size)
+            # Adjust if we hit image edges
+            if cx2 - cx1 < crop_size:
+                cx1 = max(0, cx2 - crop_size)
+            if cy2 - cy1 < crop_size:
+                cy1 = max(0, cy2 - crop_size)
+            cw = cx2 - cx1
+            ch = cy2 - cy1
+
+            logger.info(f"Mask bbox: ({x1},{y1})-({x2},{y2}), crop region: ({cx1},{cy1})-({cx2},{cy2}) = {cw}x{ch}")
+
+            # Crop the original image and mask to the region
+            crop_img = init_resized.crop((cx1, cy1, cx2, cy2))
+            crop_mask = mask_resized.crop((cx1, cy1, cx2, cy2))
+
+            # Use img2img pipeline if available, otherwise fall back
+            _i2i_pipe = alt_pipe if alt_type == 'img2img' else None
+            # Ensure crop image is properly sized (multiple of 8)
+            crop_img = crop_img.resize((cw, ch))
+            try:
+                if _i2i_pipe:
+                    logger.info(f"Using img2img pipeline on crop ({cw}x{ch})")
+                    result = _i2i_pipe(
+                        prompt=req.prompt,
+                        image=crop_img,
+                        num_inference_steps=steps,
+                        strength=strength,
+                        guidance_scale=7.0,
+                    )
+                else:
+                    # Try main pipeline with image arg
+                    result = _pipe(
+                        prompt=req.prompt,
+                        image=crop_img,
+                        num_inference_steps=steps,
+                        strength=strength,
+                        guidance_scale=3.5,
+                    )
+                generated_crop = result.images[0].resize((cw, ch))
+            except TypeError:
+                # No img2img support at all — txt2img on crop size
+                logger.info("No img2img support — txt2img on crop region")
+                result = _pipe(
+                    prompt=req.prompt,
+                    width=cw,
+                    height=ch,
+                    num_inference_steps=steps,
                     guidance_scale=3.5,
                 )
-            generated_crop = result.images[0].resize((cw, ch))
-        except TypeError:
-            # No img2img support at all — txt2img on crop size
-            logger.info("No img2img support — txt2img on crop region")
-            result = _pipe(
-                prompt=req.prompt,
-                width=cw,
-                height=ch,
-                num_inference_steps=steps,
-                guidance_scale=3.5,
-            )
-            generated_crop = result.images[0].resize((cw, ch))
+                generated_crop = result.images[0].resize((cw, ch))
 
-        # Apply feathering to the cropped mask for soft blending edges
-        if feather > 0:
-            from PIL import ImageFilter
-            # PIL GaussianBlur radius is ~half of CSS blur pixels, so multiply
-            blur_radius = feather * 1.5
-            crop_mask = crop_mask.filter(ImageFilter.GaussianBlur(radius=blur_radius))
-            logger.info(f"Applied {feather}px feather (PIL radius={blur_radius:.0f}) to crop mask")
+            # Apply feathering to the cropped mask for soft blending edges
+            if feather > 0:
+                from PIL import ImageFilter
+                # PIL GaussianBlur radius is ~half of CSS blur pixels, so multiply
+                blur_radius = feather * 1.5
+                crop_mask = crop_mask.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+                logger.info(f"Applied {feather}px feather (PIL radius={blur_radius:.0f}) to crop mask")
 
-        # Composite: blend generated crop into original using the feathered mask
-        orig_arr = np.array(init_resized).astype(float)
-        gen_full = orig_arr.copy()
-        crop_gen_arr = np.array(generated_crop).astype(float)
-        crop_mask_arr = np.array(crop_mask) / 255.0
+            # Composite: blend generated crop into original using the feathered mask
+            orig_arr = np.array(init_resized).astype(float)
+            gen_full = orig_arr.copy()
+            crop_gen_arr = np.array(generated_crop).astype(float)
+            crop_mask_arr = np.array(crop_mask) / 255.0
 
-        # Blend only in the crop region
-        region = gen_full[cy1:cy2, cx1:cx2]
-        blended_region = region * (1 - crop_mask_arr[:, :, None]) + crop_gen_arr * crop_mask_arr[:, :, None]
-        gen_full[cy1:cy2, cx1:cx2] = blended_region
+            # Blend only in the crop region
+            region = gen_full[cy1:cy2, cx1:cx2]
+            blended_region = region * (1 - crop_mask_arr[:, :, None]) + crop_gen_arr * crop_mask_arr[:, :, None]
+            gen_full[cy1:cy2, cx1:cx2] = blended_region
 
-        result_img = PILImage.fromarray(gen_full.astype(np.uint8))
+            result_img = PILImage.fromarray(gen_full.astype(np.uint8))
 
-        buf = io.BytesIO()
-        result_img.save(buf, format="PNG")
-        b64 = base64.b64encode(buf.getvalue()).decode()
-        elapsed = time.time() - start
-        logger.info(f"Inpaint (crop+composite) done in {elapsed:.1f}s")
-        return {"image": b64, "elapsed": round(elapsed, 2)}
+            buf = io.BytesIO()
+            result_img.save(buf, format="PNG")
+            b64 = base64.b64encode(buf.getvalue()).decode()
+            elapsed = time.time() - start
+            logger.info(f"Inpaint (crop+composite) done in {elapsed:.1f}s")
+            return {"image": b64, "elapsed": round(elapsed, 2)}
 
     img = result.images[0]
     # Upscale back to the canvas size if we worked at a smaller resolution.
