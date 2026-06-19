@@ -75,6 +75,8 @@ services:
         condition: service_healthy
       chromadb:
         condition: service_started
+      ollama:
+        condition: service_started
     restart: unless-stopped
 
   chromadb:
@@ -137,6 +139,19 @@ services:
       start_period: 10s
     restart: unless-stopped
 
+  ollama:
+    image: docker.io/ollama/ollama:latest
+    volumes:
+      - ollama-data:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+
   ntfy:
     image: docker.io/binwiederhier/ntfy
     command: serve
@@ -152,3 +167,4 @@ volumes:
   searxng-data:
   chromadb-data:
   ntfy-cache:
+  ollama-data:

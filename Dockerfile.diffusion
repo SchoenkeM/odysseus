@@ -1,0 +1,52 @@
+# Dockerfile.diffusion — FLUX / Stable Diffusion image generation server
+#
+# Build context: odysseus/ (same as main Dockerfile)
+# Used by docker/diffusion.yml overlay.
+#
+# Base image: official PyTorch + CUDA. Pin the minor version so the
+# driver ABI stays stable; bump deliberately when upgrading CUDA or torch.
+FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
+
+RUN pip install --no-cache-dir \
+    "diffusers[torch]" \
+    "transformers" \
+    "accelerate" \
+    sentencepiece \
+    protobuf \
+    fastapi \
+    "uvicorn[standard]" \
+    httpx \
+    pydantic \
+    Pillow \
+    numpy \
+    huggingface_hub
+
+WORKDIR /app
+COPY scripts/diffusion_server.py scripts/diffusion_server.py
+
+# HuggingFace model cache — mount as a named volume so models survive rebuilds.
+VOLUME ["/root/.cache/huggingface"]
+ENV HF_HOME=/root/.cache/huggingface
+
+EXPOSE 8100
+
+# Default: FLUX.1-schnell (Apache 2.0, no HF login required) with CPU offload.
+#
+# --cpu-offload: moves model layers to CPU RAM between inference steps.
+#   Required on a 12 GB GPU — FLUX.1-schnell is 33 GB in BF16 full precision.
+#   Trade-off: image generation takes 2-5 min instead of 30s, but the GPU
+#   stays mostly free for Ollama in between generations.
+#
+# --allowed-host diffusion: lets the Odysseus container reach this server
+#   by its Docker service name (Host: diffusion:8100).
+#
+# Override CMD in docker/diffusion.yml or via `docker compose run` to switch
+# models, add LoRA, change steps/resolution, etc.
+ENTRYPOINT ["python3", "scripts/diffusion_server.py"]
+CMD ["--model", "black-forest-labs/FLUX.1-schnell", \
+     "--port", "8100", \
+     "--host", "0.0.0.0", \
+     "--dtype", "bfloat16", \
+     "--cpu-offload", \
+     "--allowed-host", "diffusion", \
+     "--allowed-host", "odysseus"]

@@ -1,0 +1,150 @@
+# docker/diffusion.yml — Image generation services (multi-model)
+#
+# Enabled via .env:
+#   COMPOSE_FILE=docker-compose.yml:docker/diffusion.yml
+#
+# ── Modelle & Ports ──────────────────────────────────────────────────────────
+#
+#   diffusion             FLUX.1-schnell   port 8100  (läuft immer)
+#   diffusion-dev         FLUX.1-dev       port 8101  profile: flux-dev
+#   diffusion-juggernaut  Juggernaut XL    port 8102  profile: juggernaut
+#   diffusion-realvis     RealVisXL V4.0   port 8103  profile: realvis
+#   diffusion-dreamshaper Dreamshaper XL   port 8104  profile: dreamshaper
+#
+# ── Modell starten / stoppen ─────────────────────────────────────────────────
+#
+#   docker compose --profile juggernaut up -d       # Juggernaut starten
+#   docker compose --profile juggernaut down        # Juggernaut stoppen
+#   docker compose --profile flux-dev up -d         # FLUX.1-dev starten
+#
+# Nur ein SDXL-Modell gleichzeitig starten (Juggernaut/RealVisXL/Dreamshaper
+# belegen je ~7 GB VRAM). FLUX-Modelle nutzen sequential offload → idle = 0 VRAM.
+#
+# ── In Odysseus registrieren ─────────────────────────────────────────────────
+#
+#   Admin → Models → Add endpoint (für jedes Modell einmalig):
+#     http://diffusion:8100             FLUX.1-schnell
+#     http://diffusion-dev:8101         FLUX.1-dev
+#     http://diffusion-juggernaut:8102  Juggernaut XL v9
+#     http://diffusion-realvis:8103     RealVisXL V4.0
+#     http://diffusion-dreamshaper:8104 Dreamshaper XL
+#
+# ── Erster Download ──────────────────────────────────────────────────────────
+#
+#   Alle Modelle landen im gemeinsamen diffusion-cache Volume (~25 GB pro Modell).
+#   Logs beobachten: docker compose logs -f <service-name>
+
+# ── Gemeinsame Konfiguration ─────────────────────────────────────────────────
+x-diffusion-base: &diffusion-base
+  build:
+    context: .
+    dockerfile: Dockerfile.diffusion
+  volumes:
+    - diffusion-cache:/root/.cache/huggingface
+  environment:
+    - HF_TOKEN=${HF_TOKEN:-}
+    - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN:-}
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: 1
+            capabilities: [gpu]
+  restart: unless-stopped
+
+services:
+
+  # ── FLUX.1-schnell (Apache 2.0) ── läuft immer, kein Profile nötig
+  diffusion:
+    <<: *diffusion-base
+    command:
+      - "--model"
+      - "black-forest-labs/FLUX.1-schnell"
+      - "--port"
+      - "8100"
+      - "--host"
+      - "0.0.0.0"
+      - "--dtype"
+      - "bfloat16"
+      - "--cpu-offload"
+      - "--allowed-host"
+      - "diffusion"
+      - "--allowed-host"
+      - "odysseus"
+
+  # ── FLUX.1-dev (Non-Commercial) ── HF-Token + Lizenz akzeptieren nötig
+  diffusion-dev:
+    <<: *diffusion-base
+    profiles: [flux-dev]
+    command:
+      - "--model"
+      - "black-forest-labs/FLUX.1-dev"
+      - "--port"
+      - "8101"
+      - "--host"
+      - "0.0.0.0"
+      - "--dtype"
+      - "bfloat16"
+      - "--cpu-offload"
+      - "--allowed-host"
+      - "diffusion-dev"
+      - "--allowed-host"
+      - "odysseus"
+
+  # ── Juggernaut XL v9 ── ~7 GB VRAM, kein Offload nötig, Photorealismus
+  diffusion-juggernaut:
+    <<: *diffusion-base
+    profiles: [juggernaut]
+    command:
+      - "--model"
+      - "RunDiffusion/Juggernaut-XL-v9"
+      - "--port"
+      - "8102"
+      - "--host"
+      - "0.0.0.0"
+      - "--dtype"
+      - "float16"
+      - "--allowed-host"
+      - "diffusion-juggernaut"
+      - "--allowed-host"
+      - "odysseus"
+
+  # ── RealVisXL V4.0 ── ~7 GB VRAM, Szenen & Natur
+  diffusion-realvis:
+    <<: *diffusion-base
+    profiles: [realvis]
+    command:
+      - "--model"
+      - "SG161222/RealVisXL_V4.0"
+      - "--port"
+      - "8103"
+      - "--host"
+      - "0.0.0.0"
+      - "--dtype"
+      - "float16"
+      - "--allowed-host"
+      - "diffusion-realvis"
+      - "--allowed-host"
+      - "odysseus"
+
+  # ── Dreamshaper XL ── ~7 GB VRAM, vielseitig & schnell
+  diffusion-dreamshaper:
+    <<: *diffusion-base
+    profiles: [dreamshaper]
+    command:
+      - "--model"
+      - "Lykon/dreamshaper-xl-v2-turbo"
+      - "--port"
+      - "8104"
+      - "--host"
+      - "0.0.0.0"
+      - "--dtype"
+      - "float16"
+      - "--allowed-host"
+      - "diffusion-dreamshaper"
+      - "--allowed-host"
+      - "odysseus"
+
+volumes:
+  diffusion-cache:

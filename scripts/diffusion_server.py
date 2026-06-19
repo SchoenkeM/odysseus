@@ -142,9 +142,36 @@ def _fix_meta_tensors(pipe, dtype):
             logger.info(f"  Fixed {fixed} meta tensors in {name}")
 
 
+def _make_clip_compat_init(orig):
+    def _patched_init(self, config, *args, **kwargs):
+        orig(self, config, *args, **kwargs)
+        if not hasattr(self, 'text_model'):
+            # Newer transformers inlined CLIPTextTransformer into CLIPTextModel,
+            # removing the .text_model sub-module. diffusers still accesses it.
+            # Use object.__setattr__ to bypass nn.Module.__setattr__ — otherwise
+            # registering self as its own child module creates a circular graph
+            # that causes infinite recursion when the module tree is traversed.
+            object.__setattr__(self, 'text_model', self)
+    return _patched_init
+
+
+def _apply_clip_compat():
+    try:
+        from transformers import CLIPTextModel, CLIPTextModelWithProjection
+        for cls in (CLIPTextModel, CLIPTextModelWithProjection):
+            if not getattr(cls, '_text_model_compat_patched', False):
+                cls.__init__ = _make_clip_compat_init(cls.__init__)
+                cls._text_model_compat_patched = True
+        logger.debug("CLIP text_model compat patch applied")
+    except Exception as e:
+        logger.debug(f"CLIP compat patch skipped: {e}")
+
+
 def load_model():
     global _pipe, _model_id
     import diffusers
+
+    _apply_clip_compat()
 
     model_path = _args.model
     _model_id = Path(model_path).name
@@ -225,8 +252,16 @@ def load_model():
 
         if use_offload:
             try:
-                _pipe.enable_model_cpu_offload()
-                logger.info(f"Loaded as {name} with CPU offload")
+                # FLUX models have a device-mismatch bug with enable_model_cpu_offload()
+                # during inference (CLIP encoder weights stay on CPU while inputs land on
+                # CUDA). Sequential offload avoids this by moving one layer at a time.
+                _is_flux = "flux" in _model_lower
+                if _is_flux:
+                    _pipe.enable_sequential_cpu_offload()
+                    logger.info(f"Loaded as {name} with sequential CPU offload (FLUX)")
+                else:
+                    _pipe.enable_model_cpu_offload()
+                    logger.info(f"Loaded as {name} with CPU offload")
                 return True
             except Exception as e:
                 logger.warning(f"{name} + cpu_offload failed: {e}")
@@ -328,7 +363,7 @@ def load_model():
             _SD3_CONFIGS = ["stabilityai/stable-diffusion-3-medium-diffusers"]
             _FLUX2_CONFIGS = ["black-forest-labs/FLUX.2-dev"]
             _FLUX_CONFIGS = ["black-forest-labs/FLUX.1-schnell", "black-forest-labs/FLUX.1-dev"]
-            _SDXL_CONFIGS = ["stabilityai/stable-diffusion-xl-base-1.0"]
+            _SDXL_CONFIGS = ["stabilityai/stable-diffusion-xl-base-1.0", None]
 
             # Build ordered pipeline candidates based on model name hints
             _pipeline_configs = []
